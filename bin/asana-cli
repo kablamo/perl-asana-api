@@ -1,0 +1,656 @@
+#!/usr/bin/env perl
+use utf8;
+
+use Moo;
+use DDP 'p', 'np', indent => 2;
+use Getopt::Long qw(GetOptions);
+use JSON::MaybeXS;
+use Path::Tiny;
+#use Devel::Confess;
+
+use Asana;
+
+my $BOLD = "\e[1m";
+my $UNBOLD = "\e[0m";
+my $PAGER;
+
+binmode STDOUT, ':encoding(UTF-8)';
+binmode STDERR, ':encoding(UTF-8)';
+
+has asana  => (is => 'ro', lazy => 1, builder => 1, handles => [qw(camel_to_snake schema)]);
+has jsonxs => (is => 'ro', lazy => 1, builder => 1);
+
+sub _build_asana  { Asana->new() }
+sub _build_jsonxs { JSON::MaybeXS->new->utf8->pretty->canonical->space_before(0)->indent_length(2) };
+
+sub usage {
+    print $PAGER <<'END_USAGE';
+Usage: asana-cli call <method> <json>  Call a method.  Pass params as JSON.
+Usage: asana-cli list <keyword>        List all methods that match a keyword.
+Usage: asana-cli doc <method>          Show documentation for a specific method.
+Usage: asana-cli build-doc             Build documentation for all methods.
+
+This script is useful for developers writing code against the Asana API.
+
+OPTIONS:
+    -h, --help                        Show this help message
+END_USAGE
+
+    exit;
+}
+
+sub parse_options {
+    my $self = shift;
+    my %options;
+
+    GetOptions(
+        'help|h'        => \$options{help},
+    ) or die "Error in command line arguments\n";
+
+    usage() if $options{help};
+
+
+    return \%options;
+}
+
+sub call_subroutine {
+    my ($self, $subroutine, $json) = @_;
+
+    die "No subroutine specified to run\n" if !$subroutine;
+
+    $subroutine = $self->camel_to_snake($subroutine);
+
+    die "Subroutine '$subroutine' does not exist\n"
+        unless $self->asana->can($subroutine);
+
+    my $params   = $json ? $self->jsonxs->decode($json) : {};
+    my $response = $self->asana->$subroutine(%$params);
+
+    print $PAGER $self->jsonxs->encode($response->data);
+}
+
+sub by_tag {
+    return $a->{tag} cmp $b->{tag} || 
+           $a->{path} cmp $b->{path};
+}
+
+sub list_subroutines {
+    my ($self, $keyword) = @_;
+
+    my @routes;
+    for my $route ($self->schema->routes->each) {
+        next if !$route->{operation_id};
+
+        my $subroutine = $self->camel_to_snake($route->{operation_id});
+        next if $keyword && $subroutine !~ /$keyword/i;
+
+        push @routes, $route;
+    }
+
+    if (!@routes) {
+        print $PAGER "No subroutines found matching '$keyword'\n";
+        return;
+    }
+
+    foreach my $route (@routes) {
+        my $method = $route->{method};
+        my $path   = $route->{path};
+        my $tag    = $self->schema->get(['paths'])->{$path}->{$method}->{tags}->[0];
+        $route->{tag} = $tag;
+    }
+
+    #print $PAGER "Matching AsanaAPI subroutines:\n\n";
+    my $current_tag = '';
+    foreach my $route (sort by_tag @routes) {
+        if ($route->{tag} ne $current_tag) {
+            $current_tag = $route->{tag};
+            print $PAGER "\n${BOLD}$current_tag API${UNBOLD}\n";
+        }
+
+        my $sub = $route->{operation_id};
+        $sub = $self->camel_to_snake($sub);
+        my $summary = $self->schema->get(['paths', $route->{path}, $route->{method}, 'summary']);
+        my $path = $route->{path} || '';
+       #printf($PAGER "  %-43s %-55s %s\n", "$sub()", $path, $summary // '');
+        printf($PAGER "  %-43s %s\n", "$sub()", $summary // '');
+    }
+    print $PAGER "\n";
+}
+
+sub format_description {
+    my ($self, $description) = @_;
+
+    $description //= '';
+    $description =~ s/\n/  /g;  # Remove newlines for better readability
+    $description = "      - description: $description";
+    $description = $self->wrap_text($description, 68) . "\n";
+
+    my ($desc_first, @extra) = split /\n/, $description;
+
+    return $desc_first if !@extra;
+
+    my $desc_extra = join("\n", @extra);
+    $desc_extra = $self->indent_text($desc_extra, 10);
+    return "$desc_first\n$desc_extra";
+}
+
+sub print_parameters {
+    my ($self, $type, $this_route, $op_spec) = @_;
+
+    # Get path, query, and body parameters from the $SPECIFICATION
+    my $param_specs = $self->get_params($this_route, $op_spec)->{lc $type};
+
+    # Print body params header
+    if ($param_specs->{_header_}) {
+        my $_h = delete $param_specs->{_header_};
+        my $description  = "Description: $_h->{description}";
+        my $content_type = "Content-Type Header: $_h->{'content-type'}";
+        print $PAGER $self->indent_text($content_type) . "\n\n";
+        #print $PAGER $self->indent_text($description)  . "\n\n";
+    }
+
+    # Print a description of each parameter
+    my $text = '';
+    for my $param_name (sort keys %$param_specs) {
+        my $param_spec = $param_specs->{$param_name};
+       #print $PAGER "\n$param_name\n"; print $PAGER np($param_spec) . "\n";
+        my $name = $param_spec->{name} || $param_name;
+        my $type = $param_spec->{schema}->{type} || $param_spec->{type} || '';
+        my $required    = $param_spec->{required} ? 'true' : 'false';
+        my $description = $self->format_description($param_spec->{description});
+
+        $text .= "    ▶ $name\n";
+        $text .= "$description\n";
+        $text .= "      - required: $required\n" if $param_spec->{required};
+        $text .= "      - type: $type\n";
+    }
+    $text ||= "    ▶ none\n";
+
+    print $PAGER $text;
+}
+
+sub parse_spec {
+    my ($self, $param, $path_params, $query_params) = @_;
+    my ($param_def, $param_type, $param_name, $param_id);
+
+    if ($param->{'$ref'}) {
+        my @path    = split(m|/|, $param->{'$ref'});
+        $param_id   = pop @path;
+        $param_def  = $self->schema->get(['components', 'parameters', $param_id]);
+        $param_name = $param_def->{name} || $param_id;
+        $param_type = $param_def->{in} || 'query';
+    }
+    else {
+        $param_name = $param->{name};
+        $param_def  = $param;
+        $param_type = $param->{in} || 'query';
+    }
+
+    $path_params->{$param_name}  = $param_def if $param_type eq 'path';
+    $query_params->{$param_name} = $param_def if $param_type eq 'query';
+}
+
+# Get path query and body parameters from the $SPECIFICATION
+sub get_params {
+    my ($self, $this_route, $op_spec) = @_;
+    my $path_params  = {};
+    my $query_params = {};
+
+    # Get path and query parameters from the operation specification
+    my $op_params = $op_spec->{parameters};
+    $self->parse_spec($_, $path_params, $query_params)
+        foreach @$op_params;
+
+    # Get path and query parameters from the operation > method specification
+    my $method = $this_route->{method};
+    my $op_method_params = $op_spec->{$method}->{parameters};
+    $self->parse_spec($_, $path_params, $query_params)
+        foreach @$op_method_params;
+
+    # Get body parameters from the operation specification
+    my $opId = $this_route->{operation_id};
+    my $example;
+    if ($op_spec->{$method}->{requestBody}) {
+        my $request_body = $op_spec->{$method}->{requestBody};
+        my $content_type = (keys %{$request_body->{content}})[0];
+        my $request_spec = $request_body->{content}->{$content_type}->{schema};
+
+        $example = $self->make_object($request_spec, doc => 1);
+        $example = $example->{data} if $example && $example->{data};
+        $example->{_header_}->{description}    = $request_body->{description};
+        $example->{_header_}->{"content-type"} = $content_type;
+    }
+
+    return {
+        path  => $path_params, 
+        query => $query_params,
+        body  => $example,
+    };
+}
+
+sub lookup_schema {
+    my ($self, $ref) = @_;
+    my @ref_path = split(m|/|, $ref);
+    my $ref_name = pop @ref_path;
+    my $ref_schema = $self->schema->get(['components', 'schemas', $ref_name]);
+    return $ref_schema;
+}
+
+sub make_object {
+    my ($self, $node, %args) = @_;
+
+    return undef if !$node;
+
+    # If the node is a reference to a schema, look it up
+    $node = $self->lookup_schema($node) if $node =~ m|^#/components/schemas/|;
+    $node = $self->lookup_schema($node->{'$ref'}) if $node->{'$ref'};
+
+    if ($node->{properties}) {
+        my $properties = $node->{properties};
+
+        my $object;
+        for my $name (sort keys %$properties) {
+            next if $args{doc} && $properties->{$name}->{readOnly};  # Skip read-only properties
+            my $property = $properties->{$name};
+            my $result   = $self->make_object($property, %args);
+            $object->{$name} = $result if $result;
+        }
+        return $object;
+    }
+
+    if ($node->{allOf}) {
+        my $object = {};
+        for my $sub_node (@{$node->{allOf}}) {
+            return if $args{doc} && $sub_node->{readOnly};  # Skip read-only properties
+            my $sub_object = $self->make_object($sub_node, %args);
+            $object = { %$object, %$sub_object } if $sub_object;
+        }
+        return $object;
+    }
+
+    return undef if !$node->{type};
+
+    if ($args{example}) {
+        return $node->{example} if $node->{type} eq 'string';
+        return $node->{example} if $node->{type} eq 'boolean';
+        return $node->{example} if $node->{type} eq 'integer';
+        return $node->{example} if $node->{type} eq 'number';
+    }
+    if ($args{doc}) {
+        return if $node->{readOnly};  # Skip read-only properties
+        return $node if $node->{type} eq 'string';
+        return $node if $node->{type} eq 'boolean';
+        return $node if $node->{type} eq 'integer';
+        return $node if $node->{type} eq 'number';
+        return $node if $node->{type} eq 'array';
+    }
+
+    return [ $self->make_object($node->{items}->{'$ref'}, %args) ]
+        if $node->{type} eq 'array';
+
+    return undef;
+}
+
+sub get_response_spec {
+    my ($self, $method, $op_spec) = @_;
+
+    # these are the only 2 success codes as of time of writing.
+    my $code; 
+    $code = 200 if $op_spec->{$method}->{responses}->{200} && $op_spec->{$method}->{responses}->{200}->{description};
+    $code = 201 if $op_spec->{$method}->{responses}->{201} && $op_spec->{$method}->{responses}->{201}->{description};
+    my $response = $op_spec->{$method}->{responses}->{$code};
+
+    # application/json is the only content type as of time of writing.
+    return
+        if !$response
+        || !$response->{content}
+        || !$response->{content}->{'application/json'}
+        || !$response->{content}->{'application/json'}->{schema}
+        || !$response->{content}->{'application/json'}->{schema}->{properties}
+        || !$response->{content}->{'application/json'}->{schema}->{properties}->{data};
+
+    my $node = $response->{content}->{'application/json'}->{schema};
+    return ($code, $node);
+}
+
+sub print_example_response {
+    my ($self, $method, $op_spec) = @_;
+
+    my ($response_code, $response_spec) = $self->get_response_spec($method, $op_spec);
+    return if !$response_code || !$response_spec;
+    my $example = $self->make_object($response_spec, example => 1);
+
+    print $PAGER "\n  ${BOLD}Example $response_code Response\n${UNBOLD}";
+    print $PAGER $self->indent_text($self->jsonxs->encode($example)) if $example;
+    print $PAGER "\n";
+}
+
+sub print_header {
+    my ($self, $this_route, $op_spec) = @_;
+
+    my $subroutine = $self->camel_to_snake($this_route->{operation_id});
+    my $lc_method  = $this_route->{method} || '';
+    my $summary    = $op_spec->{$lc_method}->{summary} || 'No summary available';
+    my $method     = uc $lc_method;
+    my $path       = $this_route->{path} || '';
+
+    my $description = $op_spec->{$lc_method}->{description} || '';
+    $description =~ s|<table.*?</table>||is;
+    $description =~ s|<b>Required scope.*?</code>||is;
+    $description =~ s|^\s+||;
+    $description =~ s|\n{2,}|__NEW_LINE__|g;
+    $description =~ s|\n| |g;
+    $description =~ s|__NEW_LINE__|\n\n|g;
+    $description = $self->wrap_text($description, 75);
+
+    my $text = '';
+    $text .= "${BOLD}Subroutine:${UNBOLD}   $subroutine()\n";
+    $text .= "${BOLD}Summary:${UNBOLD}      $summary\n";
+    $text .= "${BOLD}Method:${UNBOLD}       $method\n";
+    $text .= "${BOLD}Path:${UNBOLD}         $path\n\n";
+    $text .= "$description\n";
+    $self->print_box($text);
+}
+
+sub get_required_params {
+    my ($self, $this_route, $op_spec) = @_;
+    my $required_params = {};
+
+    my $params = $self->get_params($this_route, $op_spec);
+
+    # Required path params
+    for my $param_name (keys %{$params->{path}}) {
+        $required_params->{$param_name} = $params->{path}->{$param_name}->{example}
+            if $params->{path}->{$param_name}->{required};
+    }
+
+    # Required query params
+    for my $param_name (keys %{$params->{query}}) {
+        $required_params->{$param_name} = $params->{query}->{$param_name}->{example}
+            if $params->{query}->{$param_name}->{required};
+    }
+
+    # Required body params
+    for my $param_name (keys %{$params->{body}}) {
+        $required_params->{$param_name} = $params->{body}->{$param_name}->{example}
+            if $params->{body}->{$param_name}->{required};
+    }
+
+    return $required_params;
+}
+
+sub response_is_array {
+    my ($self, $method, $op_spec) = @_;
+    my (undef, $response_spec) = $self->get_response_spec($method, $op_spec);
+    return 0 if !$response_spec
+             || !$response_spec->{properties}
+             || !$response_spec->{properties}->{data}
+             || !$response_spec->{properties}->{data}->{type}
+             || $response_spec->{properties}->{data}->{type} ne 'array';
+    return 1;
+}
+
+sub print_example_code {
+    my ($self, $this_route, $op_spec) = @_;
+    my $method = $this_route->{method};
+    my $op_id  = $this_route->{operation_id};
+
+    my $subroutine = $self->camel_to_snake($op_id);
+    my $params     = $self->get_required_params($this_route, $op_spec) || {};
+    my $is_array   = $self->response_is_array($method, $op_spec);
+
+    my $params_in = '';
+    my $params_out = '';
+    for my $param_name (keys %$params) {
+        next if !$params->{$param_name};
+        $params_in  .= "    $param_name => '$params->{$param_name}',\n";
+        $params_out .= $is_array
+            ? "    print \$item->{$param_name} . \"\\n\";\n"
+            : "print \$response->{$param_name} . \"\\n\";\n";
+    }
+    $params_in = "\n" . $params_in if $params_in;
+    
+
+    my $example_code = <<END_CODE;
+my \$asana = Asana->new();
+my \$response = \$asana->$subroutine($params_in);
+END_CODE
+    $example_code .= $is_array
+        ? "while (my \$item = \$response->next_item) {\n$params_out\n}"
+        : $params_out;
+
+    $example_code = $self->indent_text($example_code, 4);
+    print $PAGER "\n$example_code\n";
+}
+
+sub print_asana_cli {
+    my ($self, $this_route, $op_spec) = @_;
+
+    my $subroutine = $self->camel_to_snake($this_route->{operation_id});
+    my $params     = $self->get_required_params($this_route, $op_spec);
+
+    # Convert data to json
+    my $jsonxs = JSON::MaybeXS->new->utf8->canonical;
+    my $json = $params 
+        ? "'" . $jsonxs->encode($params) . "'"
+        : '';
+
+    my $asana_cli_code = <<END_CODE;
+asana-cli call $subroutine $json
+END_CODE
+
+    $asana_cli_code = $self->indent_text($asana_cli_code, 4);
+    print $PAGER "\n$asana_cli_code\n\n";
+}
+
+sub doc_subroutine {
+    my ($self, $subroutine) = @_;
+
+    die "No subroutine specified for documentation\n" if !$subroutine;
+    die "Subroutine '$subroutine' does not exist\n" 
+        if !$self->asana->can($subroutine);
+
+    my $operation_id = $self->snake_to_camel($subroutine);
+    my $this_route;
+    my $op_spec;
+    for my $route ($self->schema->routes->each) {
+        next if $route->{operation_id} ne $operation_id;
+        $this_route = $route;
+        $op_spec = $self->schema->get(['paths'])->{$route->{path}};
+    }
+
+    my $method = $this_route->{method};
+    my $path   = $this_route->{path};
+    my $op_id  = $this_route->{operation_id};
+
+    $self->print_header($this_route, $op_spec);
+
+    print $PAGER "\n  ${BOLD}Path Parameters\n${UNBOLD}";
+    $self->print_parameters('Path', $this_route, $op_spec);
+
+    print $PAGER "\n  ${BOLD}Query Parameters\n${UNBOLD}";
+    $self->print_parameters('Query', $this_route, $op_spec);
+
+    print $PAGER "\n  ${BOLD}Body Parameters\n${UNBOLD}";
+    $self->print_parameters('Body', $this_route, $op_spec);
+
+    $self->print_example_response($method, $op_spec);
+
+    print $PAGER "\n  ${BOLD}Example With Perl Code\n${UNBOLD}";
+    $self->print_example_code($this_route, $op_spec);
+
+    print $PAGER "\n  ${BOLD}Example With asana-cli\n${UNBOLD}";
+    $self->print_asana_cli($this_route, $op_spec);
+}
+
+sub build_doc {
+    my $self = shift;
+
+    #print $PAGER "Building documentation for Asana API subroutines...\n\n";
+    $BOLD = "";
+    $UNBOLD = "";
+
+    my @routes;
+    for my $route ($self->schema->routes->each) {
+        my $method = $route->{method};
+        my $path   = $route->{path};
+        my $op_id  = $route->{operation_id};
+
+        next if !$op_id;
+
+        $route->{subroutine} = $self->camel_to_snake($op_id);
+        $route->{tag} = $self->schema->get(['paths'])
+            ->{$path}->{$method}->{tags}->[0];
+        
+        push @routes, $route;
+    }
+
+    my $current_tag = '';
+    foreach my $route (sort by_tag @routes) {
+        my $method = $route->{method};
+        my $path   = $route->{path} || '';
+        my $op_id  = $route->{operation_id};
+        my $tag    = $route->{tag};
+        my $sub    = $route->{subroutine};
+
+        if ($tag ne $current_tag) {
+            $current_tag = $tag;
+           #print $PAGER "\n${BOLD}$current_tag API${UNBOLD}\n";
+            $self->print_box("\n\n${BOLD}$current_tag API${UNBOLD}\n\n ");
+        }
+
+        my $summary = $self->schema->get(['paths', $route->{path}, $route->{method}, 'summary']);
+       #printf($PAGER "  %-43s %-55s %s\n", "$sub()", $path, $summary // '');
+       #printf($PAGER "\n  %-43s %s\n", "$sub()", $summary // '');
+        $self->doc_subroutine($sub);
+    }
+    print $PAGER "\n";
+}
+
+sub indent_text {
+    my ($self, $text, $indent) = @_;
+    my @lines = split /\n/, $text;
+    $indent //= 4;  # Default indent level
+    my $indentation = ' ' x $indent;
+    my @output;
+    for my $line (@lines) {
+        $line = $indentation . $line;
+        push @output, $line;
+    }
+    return join("\n", @output);
+}
+
+sub snake_to_camel {
+    my ($self, $snake_case) = @_;
+    # Split the string by underscores and capitalize the first letter of each part
+    $snake_case =~ s/_(.)/uc($1)/ge;
+    # Capitalize the first letter of the entire string
+    $snake_case = lcfirst($snake_case);
+    $snake_case =~ s/Id\b/ID/g;  # Special case for Id to ID
+    return $snake_case;
+}
+
+sub print_box {
+    my ($self, $text) = @_;
+    
+    # Split the text into lines
+    my @lines = split /\n/, $text;
+
+    # Pad the maximum length to 80 characters
+    my $max_length = 80;
+
+    # Unicode box-drawing characters
+    my $top_left     = "\x{250C}";  # ┌
+    my $top_right    = "\x{2510}";  # ┐
+    my $bottom_left  = "\x{2514}";  # └
+    my $bottom_right = "\x{2518}";  # ┘
+    my $horizontal   = "\x{2500}";  # ─
+    my $vertical     = "\x{2502}";  # │
+
+    # print $PAGER the top border
+    print $PAGER $top_left . $horizontal x ($max_length - 2) . $top_right . "\n";
+
+    # print $PAGER each line with side borders, padded to the maximum length
+    foreach my $line (@lines) {
+        # Remove ANSI escape codes so length will count visible characters only
+        my $string = $line;
+        $string =~ s/\e\[[0-9;]*m//g;  # rm ANSI escape codes (colors, bold, etc.)
+        my $length = length($string);
+        $line .= " " x ($max_length - $length - 4);  # 4 for the side borders
+        print $PAGER "$vertical $line $vertical\n";
+    }
+
+    # print $PAGER the bottom border
+    print $PAGER $bottom_left . $horizontal x ($max_length - 2) . $bottom_right . "\n";
+}
+
+sub wrap_text {
+    my ($self, $text, $width) = @_;
+    $width //= 70;  # Default width if not provided
+    my @lines = split /\n/, $text;
+    my @wrapped_lines;
+    foreach my $line (@lines) {
+        while (length($line) > $width) {
+            my $pos = rindex($line, ' ', $width);
+            $pos = $width if $pos == -1; # No space found, break at width
+            push @wrapped_lines, substr($line, 0, $pos);
+            $line = substr($line, $pos + 1);  # Skip the space
+        }
+        push @wrapped_lines, $line;  # Add remaining text
+    }
+    return join("\n", @wrapped_lines);
+}
+
+sub log {
+    my ($self, $message) = @_;
+    print $PAGER $message;
+}
+
+sub BUILD {
+    my $self = shift;
+    open $PAGER, '|-', 'less -R' or die "Could not open pager: $!";
+    binmode $PAGER, ':encoding(UTF-8)';
+
+   # Set up a signal handler for SIGPIPE
+    $SIG{PIPE} = sub {
+        close $PAGER;
+        exit 0;  # Exit gracefully
+    };
+}
+
+#sub DEMOLISH {
+#    my $self = shift;
+#    if (defined fileno($PAGER)) {
+#        close $PAGER or warn "Could not close pager: $!";
+#    }
+#}
+
+sub go {
+    my $self = shift;
+
+    my $options = $self->parse_options();
+
+    my $command = shift @ARGV;
+    usage() if !$command || $command eq 'help';
+
+    if ($command eq 'call') {
+        my ($subroutine, $params) = @ARGV;
+        $self->call_subroutine($subroutine, $params);
+    } 
+    elsif ($command eq 'list') {
+        my $keyword = shift @ARGV;
+        $self->list_subroutines($keyword);
+    }
+    elsif ($command eq 'doc') {
+        my $subroutine = shift @ARGV;
+        $self->doc_subroutine($subroutine);
+    }
+    elsif ($command eq 'build-doc') {
+        $self->build_doc();
+    }
+    else {
+        die "Unknown command: $command\n";
+    }
+}
+
+__PACKAGE__->new->go;

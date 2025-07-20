@@ -1,0 +1,23 @@
+#!/usr/bin/env perl
+
+use Moo;
+use Asana;
+use DDP;
+use JSON::XS;
+use DDP;
+
+
+sub run {
+    my $self = shift;
+
+    my ($operationId, $json) = @ARGV;
+    my $params = $json
+        ? JSON::XS->new->pretty->canonical->decode($json)
+        : {};
+
+    my $response = Asana->new->$operationId($params);
+    p $response->data;
+}
+
+
+__PACKAGE__->new->run;
