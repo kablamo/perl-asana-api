@@ -1,4 +1,5 @@
 # Asana Perl Library
+## Overview
 This is a Perl library for the Asana API.  It is generated at runtime from the
 OpenAPI specification published by Asana.  It supports:
 - All endpoints
@@ -8,13 +9,13 @@ OpenAPI specification published by Asana.  It supports:
 - Error handling
 
 
-# Installation
+## Installation
 ```bash
 git clone git@github.com:kablamo/perl-asana-api.git
 carton
 ```
 
-# Explore the Asana API with asana-cli
+## Explore the Asana API with asana-cli
 ```bash
 bin/asana-cli --help
 bin/asana-cli list  # list all endpoints
@@ -22,7 +23,7 @@ bin/asana-cli doc get_tasks  # show documentation for the get_tasks endpoint
 bin/asana-cli call get_tasks  '{"task_gid":"11223344"}' # call the get_tasks endpoint with a task_gid parameter
 ```
 
-# How to use the library in your code
+## How to use the library in your code
 For complete documentation, see the [documentation](https://github.com/kablamo/perl-asana-api/blob/main/lib/Asana/Documentation.pm).
 
 ```perl
