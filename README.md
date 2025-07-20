@@ -14,7 +14,7 @@ git clone git@github.com:kablamo/perl-asana-api.git
 carton
 ```
 
-# Explore the Asana API on the command line with asana-cli
+# Explore the Asana API with asana-cli
 ```bash
 bin/asana-cli --help
 bin/asana-cli list  # list all endpoints
