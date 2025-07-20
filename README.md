@@ -1,9 +1,7 @@
 # Asana Perl Library
 This is a Perl library for the Asana API.  It is generated at runtime from the
-OpenAPI specification published by Asana.
-
-It supports:
-- All endpoints in the OpenAPI specification
+OpenAPI specification published by Asana.  It supports:
+- All endpoints
 - Pagination
 - Rate limiting
 - Automatic retry
