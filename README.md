@@ -1,5 +1,4 @@
 # Asana Perl Library
-## Overview
 This is a Perl library for the Asana API.  It is generated at runtime from the
 OpenAPI specification published by Asana.  It supports:
 - All endpoints
